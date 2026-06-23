@@ -119,32 +119,63 @@ load-bearing-evidence test; when 50/50 between `hot_take` and `reaction`, ask wh
 is a quality *claim* (→ `hot_take`) or only a *feeling* (→ `reaction`). These rules are
 written down so the same call is made consistently across all 200 examples.
 
+### Three real cases that gave me pause during annotation
+These are actual posts from the collected dataset (ids reference `takemeter_dataset.csv`).
+
+1. **id 308 — "KATSEYE's Gnarly is easily the worst song I've heard in a long time"**
+   (`analysis` vs `hot_take`). The post quotes specific lyrics, which looks like evidence.
+   But the quotes are used for mockery, not to reason toward a musical conclusion — the
+   evidence isn't load-bearing. **Decided `hot_take`.**
+
+2. **id 350 — "Fifty Fifty's photobook: 123 of 195 pages are BLANK"**
+   (`reaction` vs `analysis`). It contains a hard, specific number, which pulls toward
+   `analysis`. But the dominant mode is incredulous reaction to a product ("this is actually
+   insane???"), not a built argument. **Decided `reaction`.**
+
+3. **id 61 — "The #1 most 'American' band of all time is the Grateful Dead. Fight me."**
+   (`hot_take` vs `analysis`). The title and "Fight me" framing scream `hot_take`. But the
+   body lays out numbered, substantive reasons (American-genre melting pot, improvisational
+   approach). Applying the "classify by the body, not the title" rule → **Decided
+   `analysis`.**
+
+A broader finding from reading real posts: both communities contain many **questions,
+recommendation requests, weekly threads, and news re-posts** that aren't *takes* at all.
+These don't fit the analysis/hot_take/reaction taxonomy, so they are **out of scope** and
+were filtered out during collection rather than forced into a label. Scoping TakeMeter to
+viewpoint-expressing posts keeps the labels clean (see §4).
+
 ---
 
 ## 4. Data collection plan
 
-**Source.** Public posts and top-level comments from r/LetsTalkMusic and r/kpop, collected
-via the Reddit API / PRAW (or saved `.json` listings). I'll pull from a mix of `hot`, `top`
-(past month/year), and active megathreads so the sample spans both careful threads and
-real-time reaction threads. Each row stored as `text`, `label`, plus `source_subreddit` and
-`permalink` for traceability.
+**Source.** Public top-level posts (title + body) from **r/LetsTalkMusic** and
+**r/kpopthoughts**, scraped via an Apify Reddit actor (full-subreddit pull from the recent
+feed). r/kpop itself was tried first but rejected: its feed is news/MV/teaser headlines, not
+*takes*, so it doesn't fit the taxonomy — r/kpopthoughts (the K-pop opinions/discussion sub)
+was used instead. Each row stores `id`, `text`, `label`, `notes`, `source`, `post_url`, plus
+`pre_labeled` and `reviewed` flags (see §7).
 
-**Target counts.** At least **200 examples total**, aiming for a balanced split of roughly
-**70–80 per label** (≥20% per label, per the project guidance). Expected natural skew:
-r/LetsTalkMusic supplies most `analysis`; r/kpop comeback/news threads supply most
-`reaction`; `hot_take` is drawn from both.
+**What was actually collected.** A raw pool of **450 posts** (300 r/LetsTalkMusic + 150
+r/kpopthoughts), cleaned (URLs stripped, empties and near-duplicates removed). After
+filtering out non-take posts (questions, recommendation requests, weekly/news threads), the
+final labeled dataset is **221 examples** in `takemeter_dataset.csv`:
 
-**Workflow.** Read 30–40 posts first to confirm the labels apply cleanly to real text and
-tighten definitions if needed (see §6). Then collect a larger raw pool (~300+), and annotate
-toward the per-label targets rather than labeling blindly in feed order.
+| label | count | share |
+|---|---|---|
+| analysis | 105 | 47.5% |
+| hot_take | 62 | 28.1% |
+| reaction | 54 | 24.4% |
 
-**If a label is underrepresented after 200:** I will (a) targeted-collect for the thin
-label — e.g., if `analysis` is short, scrape more from r/LetsTalkMusic threads and
-"unpopular opinion / let's discuss" posts; if `hot_take` is short, pull from r/kpop ranking
-and "hot take" threads — until each label clears the 20% floor. I will **not** fix imbalance
-by downsampling so aggressively that total drops below 200, and I'll report the final
-per-label counts in the README. If a label is structurally rare (<10% even after targeted
-collection), I'll reconsider merging it rather than ship a class the model can't learn.
+This clears the requirements (≥200 total, no class >70%, each class >20%). `analysis` is the
+plurality because reasoned, evidenced posts dominate r/LetsTalkMusic; `reaction` is the
+scarcest because both subs reward substance over pure emotion. Source split: r/LetsTalkMusic
+contributes most `analysis`; r/kpopthoughts contributes a larger share of `reaction` and
+`hot_take`.
+
+**If a label is underrepresented:** the lever used here was targeted harvesting — when
+`hot_take`/`reaction` ran thin, I pulled specifically from memorial/"I don't get the hype"/
+concert-rant posts (reaction, hot_take) rather than adding more analysis. The total was kept
+above 200 rather than balancing by shrinking below it.
 
 ---
 
@@ -211,14 +242,16 @@ boundaries. If I can't classify a generated post cleanly using my own rules, tha
 the definition is too loose, and I'll tighten it *before* labeling 200 real examples. I'll
 record any definition changes this prompts in the version history of this file.
 
-**b. Annotation assistance — WILL USE, with disclosure and tracking.**
-I'll use an LLM (the same Groq `llama-3.3-70b` baseline prompt, or a comparable model) to
-**pre-label** batches, then review every pre-label myself and correct it — the LLM proposes,
-I decide. To keep this honest and avoid contaminating the baseline comparison: I'll add a
-`pre_labeled` boolean and a `final_label_changed` flag to the dataset so I can report what
-share of pre-labels I overrode, and I'll disclose the tool and process in the README's AI
-usage section. The held-out **test set will be labeled by hand only** (no LLM pre-labeling)
-so the baseline isn't evaluated against labels it effectively helped write.
+**b. Annotation assistance — USED (Claude), pending my review. DISCLOSURE BELOW.**
+The 221 examples in `takemeter_dataset.csv` were **pre-labeled by an LLM (Claude)** applying
+the definitions and decision rules in §2–§3. Every row is flagged `pre_labeled = yes`, and a
+`reviewed` column is left blank for me to fill in. **These are proposed labels, not final
+ones — I must read and confirm/correct every row before training; that review is the actual
+annotation and the dataset's accuracy depends on it.** Because the notebook makes the
+train/val/test split randomly (I can't pre-designate the test rows), the honest requirement
+is to **review the entire set by hand** so the held-out test labels are human-verified before
+the Groq baseline is evaluated against them. I'll disclose this LLM-pre-labeling workflow in
+the README's AI-usage section and, after review, report how many labels I changed.
 
 **c. Failure analysis — WILL DO, with my own verification.**
 After evaluation, I'll give the AI the list of wrong predictions (text, true label, predicted
