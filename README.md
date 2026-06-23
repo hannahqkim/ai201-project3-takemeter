@@ -4,10 +4,9 @@ A fine-tuned text classifier that evaluates **discourse quality** in online musi
 communities. Given a post, TakeMeter labels *how* it supports its position — a reasoned
 argument, a bold unsupported claim, or a pure emotional reaction.
 
-This README documents the label taxonomy and the annotated dataset. The full project spec
-(community rationale, evaluation plan, success criteria, AI-tool plan) lives in
-[`planning.md`](./planning.md). Model training and evaluation results are added in later
-milestones.
+This README is the final report: community, label taxonomy, dataset, fine-tuning approach,
+zero-shot baseline, and the full evaluation. The working notes and design rationale (success
+criteria, AI-tool plan, edge-case decisions) live in [`planning.md`](./planning.md).
 
 ## Community
 
@@ -130,15 +129,31 @@ supplies a larger share of `reaction` and `hot_take`.
 
 ## AI usage
 
-Per the project's disclosure requirements:
+Specific instances of AI assistance, with what I directed, what it produced, and what I
+changed or overrode:
 
-- **Pre-labeling.** Every row in `takemeter_dataset.csv` was pre-labeled by an LLM (Claude)
-  applying the taxonomy in this README. These are **proposed** labels (`pre_labeled = yes`);
-  the `reviewed` column is for human verification. Each label must be read and confirmed or
-  corrected before training — that review is the real annotation. Because the notebook splits
-  train/val/test randomly, the full set is reviewed by hand so the held-out test labels are
-  human-verified before the zero-shot baseline is evaluated against them.
-- **Data collection.** Posts were scraped via an Apify Reddit actor (no manual copy-paste).
+1. **Annotation pre-labeling (disclosed).** I gave an LLM (Claude) my label definitions and
+   edge-case rules and directed it to assign one of `analysis`/`hot_take`/`reaction` to each
+   scraped post, and to *skip* posts that weren't takes. It produced the proposed labels in
+   `takemeter_dataset.csv` (every row flagged `pre_labeled = yes`). I review and correct these
+   myself — the `reviewed` column tracks that pass — so the final labels are human-verified
+   before training. Because the notebook splits train/val/test randomly, I review the whole
+   set so test labels aren't effectively written by the model that I then benchmark against.
+
+2. **Debugging the fine-tuning collapse.** After the first training run scored 0.471 and
+   predicted `analysis` for all 34 test posts, I asked the AI to diagnose it. It identified
+   that `warmup_steps=50` exceeded the total optimizer steps (~30 for 3 epochs on 154
+   examples), so the learning rate never warmed up and the model never left the majority
+   class. I accepted the diagnosis and the proposed fix (warmup_ratio, more epochs, macro-F1
+   model selection, class weights) — see *Training & hyperparameters* — but verified the
+   reasoning against the step math myself rather than taking it on faith.
+
+3. **Data collection.** Posts were scraped via an Apify Reddit actor (no manual copy-paste);
+   I chose the subreddits and the take-only scope.
+
+4. **Failure-pattern surfacing (evaluation).** I pasted the fine-tuned model's misclassified
+   examples to an LLM and asked it to name common themes, then re-read the cases myself to
+   confirm or discard each claimed pattern. See *Failure analysis*.
 
 ## Repository
 
@@ -146,12 +161,193 @@ Per the project's disclosure requirements:
 |---|---|
 | `planning.md` | full project spec: community, labels, edge cases, data plan, metrics, success criteria, AI-tool plan |
 | `takemeter_dataset.csv` | 221 labeled examples (single file; notebook splits it) |
-| `ai201_project3_takemeter.ipynb` | fine-tuning + evaluation pipeline (DistilBERT) and Groq zero-shot baseline |
+| `ai201_project3_takemeter_starter_clean_HK.ipynb` | fine-tuning + evaluation pipeline (DistilBERT) and Groq zero-shot baseline |
+| `baseline_results.md` | zero-shot baseline record + reflection |
+| `confusion_matrix.png` | fine-tuned confusion matrix (supplementary image; text version is in the report) |
+| `evaluation_results.json` | exported accuracy numbers for both models |
 | `README.md` | this file |
 
-## Status
+## Training & hyperparameters
 
-- [x] Milestone 1 — community + label taxonomy
-- [x] Milestone 2 — project spec (`planning.md`)
-- [x] Milestone 3 — collect + annotate dataset (221 examples)
-- [ ] Milestone 4 — fine-tune, run baseline, evaluation report
+Fine-tuned `distilbert-base-uncased` (a pretrained encoder with a fresh 3-way
+classification head) on the 154-example training split.
+
+**The first run failed and why.** With the starter defaults the model scored 0.471 and
+predicted `analysis` for every test post (a flat confusion matrix; hot_take and reaction
+recall = 0.00). The cause was a hyperparameter bug, not the data: 154 examples at batch size
+16 is ~10 optimizer steps/epoch, so 3 epochs ≈ 30 steps — but `warmup_steps=50` meant the
+learning rate was still warming up when training ended, so it never reached an effective rate
+and the model defaulted to the majority class.
+
+**Fixes made (and why):**
+
+| change | from → to | why |
+|---|---|---|
+| epochs | 3 → 10 | ~30 steps was far too few; 10 epochs (~100 steps) lets the model actually learn |
+| warmup | `warmup_steps=50` → `warmup_ratio=0.1` | warmup must scale to the real schedule, not exceed it |
+| model selection | `accuracy` → macro-`f1` | accuracy rewards predicting the majority class; macro-F1 makes all three labels count |
+| loss | unweighted → inverse-frequency **class weights** | dataset is imbalanced (analysis 47% vs reaction 24%); weights stop the model ignoring smaller classes |
+
+Learning rate (2e-5) and batch size (16) were kept at the BERT-fine-tuning standard.
+
+## Baseline (zero-shot Groq)
+
+The comparison bar is `llama-3.3-70b-versatile` (Groq) run **zero-shot** — no task-specific
+training, just a prompt. Each of the 34 test posts was sent individually at `temperature=0`
+(`max_tokens=20`) with a system prompt that (a) names the task and communities, (b) gives the
+one-sentence definition of each label, (c) shows one example post per label, and (d) instructs
+the model to **reply with only the label name**. Responses are lowercased and matched against
+the label strings; anything unmatched counts as unparseable. In the reported run **0 of 34**
+were unparseable. Full prompt is in the notebook (Section 5) and the run record is in
+[`baseline_results.md`](./baseline_results.md). Prompt skeleton:
+
+```
+You are classifying posts from r/LetsTalkMusic and r/kpopthoughts. Assign each
+post to exactly ONE of: analysis, hot_take, reaction — based on HOW it supports
+its position.
+  analysis — structured claim backed by specific, verifiable evidence.   Example: "..."
+  hot_take — bold opinion asserted with little/no evidence.               Example: "..."
+  reaction — immediate emotional response to a specific event.            Example: "..."
+Respond with ONLY the label name. Do not explain.
+```
+
+## Evaluation report
+
+Test set: 34 held-out examples (analysis 16, hot_take 10, reaction 8).
+
+**Headline: the zero-shot baseline clearly beats the fine-tuned model.** Fixing the training
+collapse more than doubled the fine-tuned model's macro-F1 (0.21 when collapsed → 0.52 here), so
+it now predicts all three classes — but at 0.56 accuracy it still trails the 70B zero-shot
+baseline (0.79) by a wide margin. On 154 training examples, fine-tuning a small encoder did
+**not** help for this task — an honest and informative result (see *Reflection*).
+
+> All fine-tuned numbers below are from one run (`evaluation_results.json`: fine-tuned acc
+> 0.559). Fine-tuning had run-to-run variance (0.471 / 0.50 / 0.559 observed) because the head
+> was randomly initialized; the notebook now calls `set_seed(42)` before model creation to make
+> a run reproducible.
+
+### Overall accuracy
+
+| model | accuracy | macro-F1 |
+|---|---|---|
+| Zero-shot baseline (Groq `llama-3.3-70b`) | **0.794** | 0.82 |
+| Fine-tuned DistilBERT (corrected) | 0.559 | 0.52 |
+| _difference (fine-tuned − baseline)_ | _−0.235_ | _−0.30_ |
+
+### Per-class metrics — both models
+
+| label | model | precision | recall | f1 | support |
+|---|---|---|---|---|---|
+| analysis | baseline | 0.75 | 0.94 | 0.83 | 16 |
+| analysis | fine-tuned | 0.71 | 0.62 | 0.67 | 16 |
+| hot_take | baseline | 0.88 | 0.70 | 0.78 | 10 |
+| hot_take | fine-tuned | 0.39 | 0.70 | 0.50 | 10 |
+| reaction | baseline | 1.00 | 0.75 | 0.86 | 8 |
+| reaction | fine-tuned | 1.00 | 0.25 | 0.40 | 8 |
+| **macro avg** | baseline | 0.88 | 0.80 | 0.82 | 34 |
+| **macro avg** | fine-tuned | 0.70 | 0.52 | 0.52 | 34 |
+
+(Baseline accuracy varies slightly run-to-run at `temperature=0` — 0.735 / 0.794 / 0.824
+observed; the bundled run in `evaluation_results.json` is 0.794. The baseline per-class above
+is from a representative baseline run [acc 0.824]; the head-to-head conclusion — baseline far
+ahead — is unchanged.)
+
+### Confusion matrix — fine-tuned model (text)
+
+Rows = true label, columns = predicted (matches `confusion_matrix.png`).
+
+| true \ pred | analysis | hot_take | reaction |
+|---|---|---|---|
+| **analysis** | 10 | 6 | 0 |
+| **hot_take** | 3 | 7 | 0 |
+| **reaction** | 1 | 5 | 2 |
+
+The clearest pattern is **over-prediction of `hot_take`** (column sum 18 vs its true support of
+10): 6 of 16 `analysis` posts and 5 of 8 `reaction` posts were called `hot_take`. `reaction` is
+badly under-caught (2 of 8, recall 0.25) — but the model never *falsely* predicts `reaction`
+(precision 1.00; the only 2 posts it called reaction were both correct). So the model defaults to
+"opinion" (`hot_take`/`analysis`) and only commits to `reaction` when the emotional signal is
+unmistakable. Predictions sit at low confidence overall (~0.4–0.6; chance on 3 classes is ~0.33),
+so the boundary is weak.
+
+### Failure analysis — 3 misclassified examples (real, from this run)
+
+1. **"…it is clear that Courtney Love was right — Taylor Swift is recycling the same lyrics,
+   themes, melodies… with zero artistic growth."** — true `hot_take`, predicted `analysis`
+   (conf 0.61, the model's *most confident* error).
+   *Why it failed:* the post lists specifics (lyrics, themes, melodies) so it carries the
+   surface markers of evidence — but they're asserted, not argued. The model learned "mentions
+   specifics → `analysis`" instead of "is the evidence load-bearing?", which is the
+   `analysis`↔`hot_take` boundary flagged as hardest in `planning.md`. **Boundary problem, not
+   labeling** — the label is correct by my rules; the distinction is too subtle for this data
+   scale.
+
+2. **"Listening to radio stations in GTA games is a spectacular way of discovering a lot of
+   excellent retro music!"** — true `reaction`, predicted `hot_take` (conf 0.46).
+   *Why it failed:* this is enthusiastic, in-the-moment appreciation with no quality argument,
+   but the model pushed it into `hot_take`. `reaction` is the smallest class (~38 train
+   examples) and the model defaults to "opinion" unless the emotional signal is unmistakable.
+   **Data problem:** too few `reaction` examples to carve the class out.
+
+3. **"More music is made in a single day now than in the entire year of 1989 and it's becoming
+   a problem."** — true `analysis`, predicted `hot_take` (conf 0.43).
+   *Why it failed:* this is a data-backed argument, but its confident, provocative framing reads
+   as a bare opinion. The model treats *assertive tone* as a `hot_take` cue and misses the
+   supporting reasoning. **Boundary problem** — same `analysis`↔`hot_take` line, in the
+   opposite direction from case 1.
+
+**What would fix it:** far more training data (each class has only ~38–43 examples), and
+specifically more *hard* examples that decouple the surface proxy from the true label
+(emotional posts that are still hot takes; evidence-listing posts that are still hot takes; data-
+backed posts in an assertive voice). A tighter definition wouldn't help — the labels are
+consistent; the model just can't learn this distinction at this scale, which is why the 70B
+zero-shot model wins.
+
+### Sample classifications
+
+Five real test posts through the fine-tuned model (predicted label + confidence):
+
+| post (snippet) | true | predicted | confidence | correct? |
+|---|---|---|---|---|
+| "Never Mind the Bollocks, Here's the Sex Pistols… I had never really given this album a shot…" | analysis | analysis | 0.62 | ✅ |
+| "SOPHIE is dead. Let's talk about her influence." | reaction | reaction | 0.56 | ✅ |
+| "Nazism in black metal bands shouldn't be socially accepted" | hot_take | hot_take | 0.50 | ✅ |
+| "…it is clear that Courtney Love was right — Taylor Swift is recycling the same lyrics…" | hot_take | analysis | 0.61 | ❌ |
+| "More music is made in a single day now than in the entire year of 1989…" | analysis | hot_take | 0.43 | ❌ |
+
+*Why a correct prediction is reasonable:* "Never Mind the Bollocks…" (predicted `analysis`,
+conf 0.62 — the model's highest-confidence call) is a structured album reflection that weighs
+substance against spectacle and reasons toward a verdict. Those concrete, load-bearing details
+are exactly what the `analysis` definition rewards, and `analysis` is the one class the model
+learned reasonably (F1 0.69).
+
+### Reflection — what the model captured vs. what I intended
+
+I intended the labels to capture **how a post argues** — specifically whether its evidence is
+*load-bearing*. What the fine-tuned model actually learned are **surface proxies**: an assertive,
+opinionated tone pulls a post toward `hot_take` (which it over-predicts), and the mere presence
+of specifics (track names, numbers, lists) pulls it toward `analysis` — without regard to whether
+there's a real *claim* or whether the evidence does any work. The errors make the gap concrete: a
+sweeping take that lists specifics became `analysis` (case 1), a data-backed argument in a punchy
+voice was read as a bare opinion (case 3), and `reaction` was largely missed (recall 0.25) since
+the model only commits to it when the emotion is unmistakable.
+
+The deeper point is the one the spec anticipated: my taxonomy encodes a *reasoning-quality*
+judgment ("is the evidence load-bearing?") that even I found hard to annotate. A 66M-parameter
+model given 154 examples can only reach for the easy correlates of that judgment, not the
+judgment itself — so it sits near chance (0.52 macro-F1, low confidence everywhere). The 70B
+zero-shot model already approximates the intended distinction (~0.82 macro-F1) without any of my
+data. The honest conclusion: the label design is sound, but for this task the value isn't in
+fine-tuning a small model on a few hundred examples — it's in the prompt-defined large model.
+
+## Spec reflection
+
+- **One way the spec helped:** `planning.md` committed in advance to **macro-F1 and per-class
+  metrics, not just accuracy**, and to a ≥20%-per-class distribution. That's exactly what
+  exposed the first model's collapse — accuracy alone (0.471) looked merely mediocre, but the
+  per-class F1s of 0.00 for two classes made the failure obvious and diagnosable.
+- **One way the implementation diverged:** the spec planned r/LetsTalkMusic + **r/kpop** and
+  Reddit API/PRAW collection. In practice r/kpop's feed was news headlines, not takes, so I
+  switched to **r/kpopthoughts**, and Reddit was unreachable via API/browser so I scraped via
+  **Apify** instead. The taxonomy survived the change; the source and tooling did not.
+
